@@ -207,6 +207,120 @@ const validDate = s => typeof s==='string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && s
 const fmt = (n,dec=1) => n===null||n===undefined?'—':Number(n).toLocaleString(undefined,{maximumFractionDigits:dec});
 const signed = n => (n>0?'+':'')+fmt(n);
 const clamp = n => Math.max(0,Math.min(100,n));
+
+/* IndexedDB storage layer - provides async key-value store with localStorage fallback */
+const DB_NAME = 'FitnessOS';
+const DB_VERSION = 1;
+const STORE_NAME = 'kvstore';
+let dbPromise = null;
+
+function openDB() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+      
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+      
+      request.onupgradeneeded = (event) => {
+        const db = event.target.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+        }
+      };
+    });
+  }
+  return dbPromise;
+}
+
+async function idbGet(key) {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.get(key);
+      request.onsuccess = () => resolve(request.result?.value);
+      request.onerror = () => reject(request.error);
+    });
+  } catch (e) {
+    console.warn('IndexedDB get failed, falling back to localStorage:', e);
+    return localStorage.getItem(key);
+  }
+}
+
+async function idbSet(key, value) {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.put({ key, value });
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } catch (e) {
+    console.warn('IndexedDB set failed, falling back to localStorage:', e);
+    localStorage.setItem(key, value);
+  }
+}
+
+async function idbRemove(key) {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.delete(key);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } catch (e) {
+    console.warn('IndexedDB remove failed, falling back to localStorage:', e);
+    localStorage.removeItem(key);
+  }
+}
+
+async function idbGetAllKeys() {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.getAllKeys();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  } catch (e) {
+    console.warn('IndexedDB getAllKeys failed, falling back to localStorage:', e);
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      keys.push(localStorage.key(i));
+    }
+    return keys;
+  }
+}
+
+async function migrateLocalStorageToIndexedDB() {
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      keys.push(localStorage.key(i));
+    }
+    
+    for (const key of keys) {
+      const value = localStorage.getItem(key);
+      if (value !== null) {
+        await idbSet(key, value);
+        localStorage.removeItem(key);
+      }
+    }
+    console.log('Migration from localStorage to IndexedDB completed');
+  } catch (e) {
+    console.warn('Migration failed, keeping localStorage:', e);
+  }
+}
+
 const KEY='fitness-os:v1';
 const fields=['calories','protein','carbs','fats','water','sleep','weight','waist','chest','hips','thigh','steps','duration','cardio','distance','energy','mood','soreness'];
 const macroFields=['calories','protein','carbs','fats'];
@@ -270,7 +384,32 @@ function mealTotals(meals){const sums={};for(const k of macroFields){sums[k]=Mat
 const PREVIOUS_KEY='fitness-os:previous-valid';
 let state=defaults(),lastRaw=null,blocked=false,dirty=false,loadedDate=today(),currentView='dashboard',toastTimer,saving=false,settingsDirty=false,settingsYear=null;
 function alertStorage(message){$('#storageAlert').hidden=false;$('#storageAlert').textContent=message;$('#recoveryActions').hidden=false}
-try{lastRaw=localStorage.getItem(KEY);if(lastRaw)state=validate(JSON.parse(lastRaw));}catch(e){blocked=true;alertStorage('Saved data could not be read. Nothing has been overwritten. Export the existing data for recovery, or import a valid backup. '+e.message)}
+
+// Initialize with IndexedDB support - try IndexedDB first, fall back to localStorage
+async function initializeStorage() {
+  try {
+    // Try to load from IndexedDB first
+    lastRaw = await idbGet(KEY);
+    if (lastRaw) {
+      state = validate(JSON.parse(lastRaw));
+    } else {
+      // Fallback to localStorage for backward compatibility
+      lastRaw = localStorage.getItem(KEY);
+      if (lastRaw) {
+        state = validate(JSON.parse(lastRaw));
+        // Migrate existing localStorage data to IndexedDB
+        await migrateLocalStorageToIndexedDB();
+      }
+    }
+  } catch(e) {
+    blocked=true;
+    alertStorage('Saved data could not be read. Nothing has been overwritten. Export the existing data for recovery, or import a valid backup. '+e.message);
+  }
+}
+
+// Start initialization immediately
+initializeStorage();
+
 function toast(message){clearTimeout(toastTimer);$('#toast').textContent=message;$('#toast').hidden=false;toastTimer=setTimeout(()=>$('#toast').hidden=true,4500)}
 /* Saving is serialized across supporting tabs. Compare the exact version that the
    caller reviewed; validate before touching storage; retain the prior valid copy. */
@@ -279,22 +418,23 @@ async function commit(next,{recover=false,expectedRaw=lastRaw}={}){
  if(blocked&&!recover){alertStorage('Saving is paused because saved data could not be read. Export your edits or recover a previous version.');return false}
  let clean;try{clean=validate(next)}catch(error){toast('Nothing saved: '+error.message);return false}
  saving=true;document.body.setAttribute('aria-busy','true');const surfaces=[$('.app'),...$$('dialog[open]')].filter(Boolean),previousInert=surfaces.map(el=>el.inert);surfaces.forEach(el=>el.inert=true);
- const perform=()=>{
-  const current=localStorage.getItem(KEY);
+ const perform=async ()=>{
+  // Check current state using IndexedDB
+  const current=await idbGet(KEY);
   if(current!==expectedRaw){alertStorage('Saved records changed after these edits were opened. Your edits have been kept. Export them or load the latest records from Data recovery.');writeDraft();return false}
   const raw=JSON.stringify(clean);
   if(raw===current){state=clean;lastRaw=raw;blocked=false;$('#storageAlert').hidden=true;$('#recoveryActions').hidden=true;return true}
   if(current!==null){let valid=false;try{validate(JSON.parse(current));valid=true}catch(error){}
-   if(valid){localStorage.setItem(PREVIOUS_KEY,current);if(localStorage.getItem(PREVIOUS_KEY)!==current)throw Error('The recovery copy could not be verified.');}
+   if(valid){await idbSet(PREVIOUS_KEY,current);if(await idbGet(PREVIOUS_KEY)!==current)throw Error('The recovery copy could not be verified.');}
   }
-  localStorage.setItem(KEY,raw);
-  if(localStorage.getItem(KEY)!==raw)throw Error('The saved version could not be verified.');
+  await idbSet(KEY,raw);
+  if(await idbGet(KEY)!==raw)throw Error('The saved version could not be verified.');
   state=clean;lastRaw=raw;blocked=false;$('#storageAlert').hidden=true;$('#recoveryActions').hidden=true;return true;
  };
  try{
   if(navigator.locks?.request){return await navigator.locks.request('fitness-os:save',{mode:'exclusive',ifAvailable:true},lock=>{if(!lock){toast('Another tab is saving. Your edits are kept; try Save again.');return false}return perform()})}
   // Older/local-file hosts may lack Web Locks. Exact-version conflict checks still apply.
-  return perform();
+  return await perform();
  }catch(error){alertStorage('Save could not be completed: '+error.message+' Your edits remain open. Export them from Data recovery. Browser storage may be full or unavailable.');return false}
  finally{saving=false;document.body.setAttribute('aria-busy','false');surfaces.forEach((el,i)=>el.inert=previousInert[i]);}
 }
@@ -381,7 +521,7 @@ function exportBackup(){
  download(JSON.stringify({...backup,exportedAt:new Date().toISOString()},null,2),'fitness-os-backup-'+today()+'.json');toast('Journal backup exported. Export your photos separately in Progress → Progress photos. Open edits remain uncommitted.');
 }
 
-$('#importFile').addEventListener('change',async e=>{const file=e.target.files[0];e.target.value='';if(!file)return;try{if(file.size>15*1024*1024)throw Error('Choose a backup smaller than 15 MB.');const parsed=JSON.parse((await file.text()).replace(/^\uFEFF/,''));if(parsed.kind==='fitness-os-photos'||parsed.kind==='fitness-os-raw-photo-recovery')throw Error('Use Progress → Progress photos → Import photos for photo archives. Raw recovery files are for inspection.');if(parsed.kind==='fitness-os-edits'){pendingDraft={key:null,raw:null,bundle:validateBundle(parsed)};restoreDraft();return}const next=validate(parsed),baseline=localStorage.getItem(KEY);if(!confirm(`Replace saved records with this backup (${Object.keys(next.logs).length} daily records)? Your previous saved version will be kept for recovery. Unfinished forms will remain recoverable.`))return;if(!parkEdits())return;if(await commit(next,{recover:true,expectedRaw:baseline})){resetFormsAfterReload();renderAll();checkDraft();toast('Backup imported successfully.')}}catch(error){toast('Import failed: '+error.message)}});
+$('#importFile').addEventListener('change',async e=>{const file=e.target.files[0];e.target.value='';if(!file)return;try{if(file.size>15*1024*1024)throw Error('Choose a backup smaller than 15 MB.');const parsed=JSON.parse((await file.text()).replace(/^\uFEFF/,''));if(parsed.kind==='fitness-os-photos'||parsed.kind==='fitness-os-raw-photo-recovery')throw Error('Use Progress → Progress photos → Import photos for photo archives. Raw recovery files are for inspection.');if(parsed.kind==='fitness-os-edits'){pendingDraft={key:null,raw:null,bundle:validateBundle(parsed)};restoreDraft();return}const next=validate(parsed),baseline=await idbGet(KEY);if(!confirm(`Replace saved records with this backup (${Object.keys(next.logs).length} daily records)? Your previous saved version will be kept for recovery. Unfinished forms will remain recoverable.`))return;if(!parkEdits())return;if(await commit(next,{recover:true,expectedRaw:baseline})){resetFormsAfterReload();renderAll();checkDraft();toast('Backup imported successfully.')}}catch(error){toast('Import failed: '+error.message)}});
 
 document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;if(b.dataset.view){navigate(b.dataset.view);return}if(b.dataset.date){openLog(b.dataset.date);return}switch(b.dataset.action){case'log-today':openLog(today());break;case'settings':openSettings();break;case'close-settings':closeSettings();break;case'add-exercise':addExercise();break;case'remove-exercise':b.closest('.exercise').remove();markDirty();break;case'reset-form':if(discardOK()){clearDraft();loadLog(loadedDate);}break;case'delete':if(confirm('Delete the check-in for '+loadedDate+'? This cannot be undone.')){const next=structuredClone(state);delete next.logs[loadedDate];if(await commit(next)){clearDraft();loadLog(loadedDate);renderAll();toast('Check-in deleted.')}}break;case'export':exportBackup();break;case'import':$('#importFile').click();break}});
 $('#historyYear').addEventListener('change',()=>selectYear(Number($('#historyYear').value)));$('#historySearch').addEventListener('input',()=>{pageState.history=1;renderHistoryTable()});$('#historyFilter').addEventListener('change',()=>{pageState.history=1;renderHistoryTable()});$('#progressRange').addEventListener('change',changeProgressPeriod);
@@ -613,16 +753,16 @@ function renderMonthlyTable(){
 /* Recovery controls never silently replace records, and never clear other tabs. */
 function resetFormsAfterReload(){clearTimeout(draftTimer);dirty=false;reviewDirty=false;profileDirty=false;settingsDirty=false;reviewBase=weekStart(today());reviewOffset=0;resetExtraEditors();$('#profileDialog').close();$('#settingsDialog').close();loadLog(validDate(loadedDate)&&loadedDate<=today()?loadedDate:today());}
 function parkEdits(){if(!hasUnsaved())return true;if(!writeDraft())return false;DRAFT_KEY=DRAFT_PREFIX+TAB_ID+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8);return true}
-function adoptLatest(){try{const raw=localStorage.getItem(KEY);if(raw===null&&lastRaw!==null)throw Error('Saved records were removed in another tab. The last records read by this tab remain available for export.');const next=raw===null?defaults():validate(JSON.parse(raw));if(!parkEdits())return false;state=next;lastRaw=raw;blocked=false;resetFormsAfterReload();$('#storageAlert').hidden=true;$('#recoveryActions').hidden=true;renderAll();checkDraft();return true}catch(error){blocked=true;alertStorage('Could not load saved records: '+error.message+' Use Data recovery to export data or restore a previous version.');return false}}
+async function adoptLatest(){try{const raw=await idbGet(KEY);if(raw===null&&lastRaw!==null)throw Error('Saved records were removed in another tab. The last records read by this tab remain available for export.');const next=raw===null?defaults():validate(JSON.parse(raw));if(!parkEdits())return false;state=next;lastRaw=raw;blocked=false;resetFormsAfterReload();$('#storageAlert').hidden=true;$('#recoveryActions').hidden=true;renderAll();checkDraft();return true}catch(error){blocked=true;alertStorage('Could not load saved records: '+error.message+' Use Data recovery to export data or restore a previous version.');return false}}
 function closeSettings(){if(settingsDirty&&!confirm('Discard unsaved annual goal changes?'))return;settingsDirty=false;writeDraft();$('#settingsDialog').close()}
 $('#settingsForm').addEventListener('input',()=>{settingsDirty=true;scheduleDraft()});
 $('#settingsForm').addEventListener('change',()=>{settingsDirty=true;scheduleDraft()});
 $('#settingsDialog').addEventListener('cancel',e=>{e.preventDefault();closeSettings()});
-function openRecovery(){let description;try{const current=localStorage.getItem(KEY),previous=localStorage.getItem(PREVIOUS_KEY);let count='unreadable';if(current){try{count=Object.keys(validate(JSON.parse(current)).logs).length+' records'}catch(error){}}else count='no data';let previousCount='not available';if(previous){try{previousCount=Object.keys(validate(JSON.parse(previous)).logs).length+' records'}catch(error){previousCount='unreadable'}}description='Current saved data: '+count+'. Previous saved version: '+previousCount+'.'}catch(error){description='Browser storage is unavailable. You can export edits still open in this page.'}$('#recoverySummary').textContent=description;$('#lockNote').textContent=navigator.locks?.request?'This browser coordinates saves across tabs.':'This browser does not support coordinated tab saves. Keep only one Fitness OS tab open while saving; version conflict checks still apply.';$('#recoveryDialog').showModal()}
+async function openRecovery(){let description;try{const current=await idbGet(KEY),previous=await idbGet(PREVIOUS_KEY);let count='unreadable';if(current){try{count=Object.keys(validate(JSON.parse(current)).logs).length+' records'}catch(error){}}else count='no data';let previousCount='not available';if(previous){try{previousCount=Object.keys(validate(JSON.parse(previous)).logs).length+' records'}catch(error){previousCount='unreadable'}}description='Current saved data: '+count+'. Previous saved version: '+previousCount+'.'}catch(error){description='Browser storage is unavailable. You can export edits still open in this page.'}$('#recoverySummary').textContent=description;$('#lockNote').textContent=navigator.locks?.request?'This browser coordinates saves across tabs.':'This browser does not support coordinated tab saves. Keep only one Fitness OS tab open while saving; version conflict checks still apply.';$('#recoveryDialog').showModal()}
 function exportEdits(){if(!hasUnsaved()){toast('There are no unfinished edits in the open forms. Use the recovery banner for other sessions.');return}download(JSON.stringify(editBundle(),null,2),'fitness-os-unfinished-'+today()+'.json');toast('Unfinished edits exported. Use Import to restore them later.')}
 function exportDraftArchive(){try{const drafts={};for(let i=0;i<localStorage.length;i++){const key=localStorage.key(i);if(key===LEGACY_DRAFT_KEY||key?.startsWith(DRAFT_PREFIX))drafts[key]=localStorage.getItem(key)}download(JSON.stringify({kind:'fitness-os-raw-draft-archive',drafts},null,2),'fitness-os-draft-recovery-'+today()+'.json');toast('Raw draft data exported for inspection.')}catch(error){toast('Cannot read drafts: '+error.message)}}
-async function restorePrevious(){try{const previous=localStorage.getItem(PREVIOUS_KEY);if(!previous)throw Error('No previous saved version is available yet.');const next=validate(JSON.parse(previous)),baseline=localStorage.getItem(KEY);if(!confirm('Restore the previous saved version ('+Object.keys(next.logs).length+' records)? The current valid version becomes the recovery copy. Unfinished edits stay recoverable.'))return;if(!parkEdits())return;if(await commit(next,{recover:true,expectedRaw:baseline})){resetFormsAfterReload();$('#recoveryDialog').close();renderAll();checkDraft();toast('Previous saved version restored.')}}catch(error){toast('Recovery failed: '+error.message)}}
-document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;switch(b.dataset.action){case'recovery':openRecovery();break;case'close-recovery':$('#recoveryDialog').close();break;case'export-edits':exportEdits();break;case'export-drafts':exportDraftArchive();break;case'reload-records':if(adoptLatest()){$('#recoveryDialog').close();toast('Latest saved records loaded. Unfinished edits are available in the recovery banner.')}break;case'export-raw':try{const raw=localStorage.getItem(KEY)??lastRaw;if(!raw){toast('No saved data is available.');break}download(raw,'fitness-os-current-recovery-'+today()+'.json')}catch(error){if(lastRaw)download(lastRaw,'fitness-os-last-read-'+today()+'.json');else toast('Saved data is unavailable. Export your open edits instead.')}break;case'export-previous':try{const raw=localStorage.getItem(PREVIOUS_KEY);if(raw)download(raw,'fitness-os-previous-'+today()+'.json');else toast('No previous saved version is available.')}catch(error){toast('Cannot read the previous saved version.')}break;case'restore-previous':await restorePrevious();break;}});
+async function restorePrevious(){try{const previous=await idbGet(PREVIOUS_KEY);if(!previous)throw Error('No previous saved version is available yet.');const next=validate(JSON.parse(previous)),baseline=await idbGet(KEY);if(!confirm('Restore the previous saved version ('+Object.keys(next.logs).length+' records)? The current valid version becomes the recovery copy. Unfinished edits stay recoverable.'))return;if(!parkEdits())return;if(await commit(next,{recover:true,expectedRaw:baseline})){resetFormsAfterReload();$('#recoveryDialog').close();renderAll();checkDraft();toast('Previous saved version restored.')}}catch(error){toast('Recovery failed: '+error.message)}}
+document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;switch(b.dataset.action){case'recovery':await openRecovery();break;case'close-recovery':$('#recoveryDialog').close();break;case'export-edits':exportEdits();break;case'export-drafts':exportDraftArchive();break;case'reload-records':if(await adoptLatest()){$('#recoveryDialog').close();toast('Latest saved records loaded. Unfinished edits are available in the recovery banner.')}break;case'export-raw':try{const raw=(await idbGet(KEY))??lastRaw;if(!raw){toast('No saved data is available.');break}download(raw,'fitness-os-current-recovery-'+today()+'.json')}catch(error){if(lastRaw)download(lastRaw,'fitness-os-last-read-'+today()+'.json');else toast('Saved data is unavailable. Export your open edits instead.')}break;case'export-previous':try{const raw=await idbGet(PREVIOUS_KEY);if(raw)download(raw,'fitness-os-previous-'+today()+'.json');else toast('No previous saved version is available.')}catch(error){toast('Cannot read the previous saved version.')}break;case'restore-previous':await restorePrevious();break;}});
 // Drawing fewer points bounds DOM work without dropping data from calculations.
 function chartSample(points){if(points.length<=600)return points;const result=[points[0]],size=Math.ceil((points.length-2)/299);for(let i=1;i<points.length-1;i+=size){const bucket=points.slice(i,Math.min(i+size,points.length-1));let min=0,max=0;for(let j=1;j<bucket.length;j++){if(bucket[j][1].weight<bucket[min][1].weight)min=j;if(bucket[j][1].weight>bucket[max][1].weight)max=j}result.push(...[...new Set([min,max])].sort((a,b)=>a-b).map(j=>bucket[j]))}result.push(points.at(-1));return result}
 const pageState={history:1,measurements:1},PAGE_SIZE=50;
@@ -785,19 +925,19 @@ function validatePhotoAlbum(raw){
  const ids=new Set(),photos=raw.photos.map(p=>{const clean=validatePhoto(p);if(ids.has(clean.id))throw Error('Duplicate photo ID in archive.');ids.add(clean.id);return clean});
  const album={kind:'fitness-os-photos',version:1,photos};if(JSON.stringify(album).length>1200000)throw Error('The photo album is full. Export an archive, then remove older photos before adding more.');return album;
 }
-function loadPhotoAlbum(){
- try{const raw=localStorage.getItem(PHOTO_KEY);if(raw===null&&photoRaw!==null)throw Error('The photo album was removed in another tab. Export the last loaded album before reloading the app.');const next=raw===null?{kind:'fitness-os-photos',version:1,photos:[]}:validatePhotoAlbum(JSON.parse(raw));photoAlbum=next;photoRaw=raw;photoBlocked=false;photoError('');return true}
- catch(error){photoBlocked=true;photoError('Photos could not be loaded: '+error.message+' Your journal is separate. Export the photo archive for recovery.');return false}
+async function loadPhotoAlbum(){
+  try{const raw=await idbGet(PHOTO_KEY);if(raw===null&&photoRaw!==null)throw Error('The photo album was removed in another tab. Export the last loaded album before reloading the app.');const next=raw===null?{kind:'fitness-os-photos',version:1,photos:[]}:validatePhotoAlbum(JSON.parse(raw));photoAlbum=next;photoRaw=raw;photoBlocked=false;photoError('');return true}
+  catch(error){photoBlocked=true;photoError('Photos could not be loaded: '+error.message+' Your journal is separate. Export the photo archive for recovery.');return false}
 }
 async function writePhotoAlbum(next,{deleted=null,recover=false,expectedRaw=photoRaw}={}){
  if(photoBusy){photoError('Another photo action is in progress. Try again after it finishes.');return false}
  if(photoBlocked&&!recover){photoError('Photo saving is paused. Export raw photo data, then import a valid photo archive to recover.');return false}
  let clean;try{clean=validatePhotoAlbum(next)}catch(error){photoError(error.message);return false}
  const expected=expectedRaw;photoBusy=true;const surfaces=[$('.photo-section'),$('#photoDialog')],oldInert=surfaces.map(el=>el.inert);surfaces.forEach(el=>el.inert=true);
- const perform=()=>{if(localStorage.getItem(PHOTO_KEY)!==expected)throw Error('Another tab changed the photo album. Your open photo is kept. Use Reload photos, review it, and save again.');
-  if(deleted){const trash=JSON.stringify(validatePhoto(deleted));localStorage.setItem(PHOTO_TRASH,trash);if(localStorage.getItem(PHOTO_TRASH)!==trash)throw Error('Could not verify the deleted-photo recovery copy.');}
-  const raw=JSON.stringify(clean);localStorage.setItem(PHOTO_KEY,raw);if(localStorage.getItem(PHOTO_KEY)!==raw)throw Error('The photo save could not be verified.');photoAlbum=clean;photoRaw=raw;photoBlocked=false;photoError('');return true};
- try{if(navigator.locks?.request)return await navigator.locks.request('fitness-os:photo-save',{mode:'exclusive',ifAvailable:true},lock=>{if(!lock)throw Error('Another tab is saving photos. Try again shortly.');return perform()});return perform()}
+ const perform=async ()=>{const current=await idbGet(PHOTO_KEY);if(current!==expected)throw Error('Another tab changed the photo album. Your open photo is kept. Use Reload photos, review it, and save again.');
+  if(deleted){const trash=JSON.stringify(validatePhoto(deleted));await idbSet(PHOTO_TRASH,trash);if(await idbGet(PHOTO_TRASH)!==trash)throw Error('Could not verify the deleted-photo recovery copy.');}
+  const raw=JSON.stringify(clean);await idbSet(PHOTO_KEY,raw);if(await idbGet(PHOTO_KEY)!==raw)throw Error('The photo save could not be verified.');photoAlbum=clean;photoRaw=raw;photoBlocked=false;photoError('');return true};
+ try{if(navigator.locks?.request)return await navigator.locks.request('fitness-os:photo-save',{mode:'exclusive',ifAvailable:true},lock=>{if(!lock)throw Error('Another tab is saving photos. Try again shortly.');return perform()});return await perform()}
  catch(error){photoError('Photo save failed: '+error.message+' Download the open preview or export the album before closing.');return false}
  finally{photoBusy=false;surfaces.forEach((el,i)=>el.inert=oldInert[i])}
 }
@@ -810,7 +950,7 @@ function renderPhotos(){
  $('#photoPager').innerHTML=photos.length?`<span class="small muted">${photos.length} matching photos · page ${photoPage} of ${pages}</span><div class="row"><button class="btn" data-photo-page="-1" ${photoPage===1?'disabled':''}>Previous</button><button class="btn" data-photo-page="1" ${photoPage===pages?'disabled':''}>Next</button></div>`:'';
  for(const [key,fallback]of [['photoBefore',photos[0]?.id],['photoAfter',photos.length>1?photos.at(-1).id:'']]){const select=$('#'+key),old=select.value;select.innerHTML='<option value="">Choose a photo</option>'+photos.map(p=>`<option value="${p.id}">${esc(photoLabel(p))}</option>`).join('');select.value=photos.some(p=>p.id===old)?old:(fallback??'')}
  renderPhotoComparison();
- try{$('[data-photo-action="restore-deleted"]').disabled=!localStorage.getItem(PHOTO_TRASH)}catch(error){$('[data-photo-action="restore-deleted"]').disabled=true}
+ try{const trashRaw=await idbGet(PHOTO_TRASH);$('[data-photo-action="restore-deleted"]').disabled=!trashRaw}catch(error){$('[data-photo-action="restore-deleted"]').disabled=true}
 }
 function renderPhotoComparison(){
  const before=photoAlbum.photos.find(p=>p.id===$('#photoBefore').value),after=photoAlbum.photos.find(p=>p.id===$('#photoAfter').value);
@@ -824,11 +964,11 @@ function openPhoto(id=null){
  const p=photoAlbum.photos.find(p=>p.id===id);photoEditId=p?.id??null;photoImage=p?{data:p.data,width:p.width,height:p.height}:null;$('#photoForm').reset();$('#photoDate').value=p?.date??today();$('#photoDate').max=today();$('#photoView').value=p?.view??'front';$('#photoCaption').value=p?.caption??'';$('#photoDialogTitle').textContent=p?'Edit progress photo':'Add progress photo';$('#photoEditStatus').textContent='';setPhotoPreview();$('#photoDialog').showModal();
 }
 function markPhotoDirty(){photoDirty=true;$('#photoEditStatus').textContent='Unsaved photo changes';clearTimeout(photoDraftTimer);photoDraftTimer=setTimeout(savePhotoDraft,300)}
-function savePhotoDraft(){
- if(!photoDirty)return;try{const raw=JSON.stringify({kind:'fitness-os-photo-draft',version:1,id:photoEditId,values:photoFormValues(),image:photoImage});localStorage.setItem(PHOTO_DRAFT_KEY,raw);if(localStorage.getItem(PHOTO_DRAFT_KEY)!==raw)throw Error('Draft could not be verified.');$('#photoEditStatus').textContent='Photo draft saved on this device · not in album yet'}
+async function savePhotoDraft(){
+ if(!photoDirty)return;try{const raw=JSON.stringify({kind:'fitness-os-photo-draft',version:1,id:photoEditId,values:photoFormValues(),image:photoImage});await idbSet(PHOTO_DRAFT_KEY,raw);if(await idbGet(PHOTO_DRAFT_KEY)!==raw)throw Error('Draft could not be verified.');$('#photoEditStatus').textContent='Photo draft saved on this device · not in album yet'}
  catch(error){$('#photoEditStatus').textContent='Draft not saved: '+error.message+'. Keep this window open and download the preview.'}
 }
-function clearPhotoDraft(){clearTimeout(photoDraftTimer);try{localStorage.removeItem(PHOTO_DRAFT_KEY)}catch(error){photoError('The old photo draft could not be removed. It may remain in recovery.')}photoDirty=false}
+async function clearPhotoDraft(){clearTimeout(photoDraftTimer);try{await idbRemove(PHOTO_DRAFT_KEY)}catch(error){photoError('The old photo draft could not be removed. It may remain in recovery.')}photoDirty=false}
 function closePhoto(){if(photoBusy)return;if((photoDirty||photoDecoding)&&!confirm('Discard the open photo changes? Saved album photos will stay.'))return;photoDecodeToken++;photoDecoding=false;clearPhotoDraft();photoImage=null;$('#photoDialog').close();checkPhotoDrafts()}
 function validatePhotoDraft(raw){
  if(!isRecord(raw)||raw.kind!=='fitness-os-photo-draft'||raw.version!==1||!isRecord(raw.values))throw Error('Invalid photo draft.');
@@ -836,8 +976,8 @@ function validatePhotoDraft(raw){
  let image=null;if(raw.image!==null){const p=validatePhoto({id:'img_draft',date:today(),view:'front',caption:'',data:raw.image.data,width:raw.image.width,height:raw.image.height});image={data:p.data,width:p.width,height:p.height}}
  return{kind:raw.kind,version:1,id:raw.id,values,image};
 }
-function checkPhotoDrafts(){
- photoDraftChoices=[];let invalid=0;try{for(let i=0;i<localStorage.length;i++){const key=localStorage.key(i);if(!key?.startsWith(PHOTO_DRAFT_PREFIX)||(key===PHOTO_DRAFT_KEY&&photoDirty))continue;const raw=localStorage.getItem(key);try{photoDraftChoices.push({key,raw,draft:validatePhotoDraft(JSON.parse(raw))})}catch(error){invalid++}}}
+async function checkPhotoDrafts(){
+ photoDraftChoices=[];let invalid=0;try{const allKeys=await idbGetAllKeys();for(const key of allKeys){if(!key?.startsWith(PHOTO_DRAFT_PREFIX)||(key===PHOTO_DRAFT_KEY&&photoDirty))continue;const raw=await idbGet(key);try{photoDraftChoices.push({key,raw,draft:validatePhotoDraft(JSON.parse(raw))})}catch(error){invalid++}}}
  catch(error){photoError('Photo drafts could not be read. '+error.message)}
  $('#photoDraftSelect').innerHTML=photoDraftChoices.map((p,i)=>`<option value="${i}">${esc(p.draft.values.date||'Undated')} · ${esc(p.draft.values.view||'Photo')} · draft ${i+1}</option>`).join('');$('#photoDraftBanner').hidden=!photoDraftChoices.length;
  if(invalid)photoError(invalid+' photo draft(s) could not be read. Export raw photo data to keep them for recovery.');
@@ -856,9 +996,9 @@ async function compressProgressPhoto(file){
  }finally{image.release()}
 }
 function downloadPhoto(p){const payload=atob(p.data.split(',')[1]),bytes=Uint8Array.from(payload,c=>c.charCodeAt(0));download(bytes,'fitness-os-'+p.date+'-'+p.view+'.jpg','image/jpeg')}
-function exportPhotoAlbum(raw=false){
+async function exportPhotoAlbum(raw=false){
  if(photoBlocked&&!raw){exportPhotoAlbum(true);toast('Unreadable photo data exported for recovery.');return}
- if(raw){const records={};try{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k===PHOTO_KEY||k===PHOTO_TRASH||k?.startsWith(PHOTO_DRAFT_PREFIX))records[k]=localStorage.getItem(k)}}catch(error){records.lastLoaded=photoRaw}download(JSON.stringify({kind:'fitness-os-raw-photo-recovery',records},null,2),'fitness-os-photo-recovery-'+today()+'.json');return}
+ if(raw){const records={};try{const allKeys=await idbGetAllKeys();for(const k of allKeys){if(k===PHOTO_KEY||k===PHOTO_TRASH||k?.startsWith(PHOTO_DRAFT_PREFIX))records[k]=await idbGet(k)}}catch(error){records.lastLoaded=photoRaw}download(JSON.stringify({kind:'fitness-os-raw-photo-recovery',records},null,2),'fitness-os-photo-recovery-'+today()+'.json');return}
  download(JSON.stringify(photoAlbum),'fitness-os-photos-'+today()+'.json');toast('Saved photos exported. Journal records and unfinished photo drafts are separate.');
 }
 async function verifyPhotoImage(p){const bytes=Uint8Array.from(atob(p.data.split(',')[1]),c=>c.charCodeAt(0)),decoded=await decodePhotoSource(new Blob([bytes],{type:'image/jpeg'}));try{if(decoded.width!==p.width||decoded.height!==p.height)throw Error('Photo dimensions do not match the archive image.')}finally{decoded.release()}}
@@ -872,7 +1012,7 @@ for(const id of ['photoDate','photoView','photoCaption'])$('#'+id).addEventListe
 $('#photoForm').addEventListener('submit',async e=>{e.preventDefault();if(photoBusy||photoDecoding)return;if(!e.currentTarget.reportValidity())return;try{if(!photoImage)throw Error('Choose a photo first.');const record=validatePhoto({id:photoEditId??makeId('img'),...photoFormValues(),...photoImage}),next=structuredClone(photoAlbum),index=next.photos.findIndex(p=>p.id===record.id);if(photoEditId&&index<0)throw Error('This photo was deleted. Close this editor and add it as a new photo.');if(index<0)next.photos.push(record);else next.photos[index]=record;if(await writePhotoAlbum(next)){clearPhotoDraft();photoImage=null;$('#photoDialog').close();renderPhotos();checkPhotoDrafts();toast('Progress photo saved on this device.')}}catch(error){$('#photoEditStatus').textContent=error.message}});
 $('#photoDialog').addEventListener('cancel',e=>{e.preventDefault();closePhoto()});
 $('#photoImportFile').addEventListener('change',async e=>{const file=e.target.files[0];e.target.value='';if(!file)return;if(photoBusy||photoDecoding){photoError('Finish the current photo action before importing.');return}try{
- if(file.size>2*1024*1024)throw Error('Choose a photo archive smaller than 2 MB.');const incoming=validatePhotoAlbum(JSON.parse(await file.text())),recovering=photoBlocked,loadedAtStart=photoRaw,baseline=recovering?localStorage.getItem(PHOTO_KEY):photoRaw,next=structuredClone(photoAlbum);let count=0;
+ if(file.size>2*1024*1024)throw Error('Choose a photo archive smaller than 2 MB.');const incoming=validatePhotoAlbum(JSON.parse(await file.text())),recovering=photoBlocked,loadedAtStart=photoRaw,baseline=recovering?await idbGet(PHOTO_KEY):photoRaw,next=structuredClone(photoAlbum);let count=0;
  for(const p of incoming.photos){const existing=next.photos.find(q=>q.id===p.id);if(existing){if(JSON.stringify(existing)!==JSON.stringify(p))throw Error('An imported photo conflicts with an existing photo. No photos were changed. Keep both archives and resolve that photo first.');continue}next.photos.push(p);count++}
  validatePhotoAlbum(next);if(!count&&!recovering){toast('All these photos are already in the album.');return}photoError('Checking imported images…');for(const p of incoming.photos)await verifyPhotoImage(p);if(photoRaw!==loadedAtStart||photoBlocked!==recovering)throw Error('The album changed while importing. Please try again.');if(!confirm(recovering?'Replace the unreadable photo store with this recovered album? The raw photo data will be downloaded first. Journal records will stay.':'Add '+count+' archived photo(s)? Existing photos and journal records will be kept.')){photoError('');return}if(recovering)exportPhotoAlbum(true);if(await writePhotoAlbum(next,{recover:recovering,expectedRaw:baseline})){renderPhotos();toast('Photo archive imported.');}
  }catch(error){photoError('Photo import failed: '+error.message)}
@@ -885,9 +1025,9 @@ document.addEventListener('click',async e=>{const b=e.target.closest('button');i
  if(b.dataset.photoDelete){const p=photoAlbum.photos.find(p=>p.id===b.dataset.photoDelete);if(!p||!confirm('Delete the '+p.view+' photo from '+p.date+'? Only the most recently deleted photo is recoverable.'))return;const next={...photoAlbum,photos:photoAlbum.photos.filter(q=>q.id!==p.id)};if(await writePhotoAlbum(next,{deleted:p})){renderPhotos();toast('Photo deleted. Use Restore last deleted to undo.')}return}
  if(b.dataset.photoPage){photoPage+=Number(b.dataset.photoPage);renderPhotos();return}
  switch(b.dataset.photoAction){case'add':openPhoto();break;case'close':closePhoto();break;case'download-preview':if(photoImage)downloadPhoto({...photoFormValues(),...photoImage});break;case'export':exportPhotoAlbum();break;case'raw':exportPhotoAlbum(true);break;case'import':$('#photoImportFile').click();break;case'reload':loadPhotoAlbum();renderPhotos();checkPhotoDrafts();break;
- case'restore-deleted':{const raw=localStorage.getItem(PHOTO_TRASH);if(!raw)throw Error('No deleted photo is available.');const p=validatePhoto(JSON.parse(raw));if(photoAlbum.photos.some(q=>q.id===p.id)){toast('That photo is already in the album.');break}if(!confirm('Restore the '+p.view+' photo from '+p.date+'?'))break;if(await writePhotoAlbum({...photoAlbum,photos:[...photoAlbum.photos,p]})){renderPhotos();toast('Deleted photo restored.')}break}
- case'restore-draft':{const item=photoDraftChoices[Number($('#photoDraftSelect').value)];if(!item)break;if(photoDirty||photoDecoding){openPhoto();break}if(localStorage.getItem(item.key)!==item.raw)throw Error('That draft changed. Reload photos to refresh recovery choices.');const d=item.draft;openPhoto();photoEditId=d.id;photoImage=d.image;$('#photoDate').value=d.values.date;$('#photoView').value=d.values.view;$('#photoCaption').value=d.values.caption;markPhotoDirty();setPhotoPreview();savePhotoDraft();break}
- case'discard-draft':{const item=photoDraftChoices[Number($('#photoDraftSelect').value)];if(!item||!confirm('Discard only this selected unfinished photo draft?'))break;if(localStorage.getItem(item.key)!==item.raw)throw Error('That draft changed. Reload photos to refresh recovery choices.');localStorage.removeItem(item.key);checkPhotoDrafts();break}
+ case'restore-deleted':{const raw=await idbGet(PHOTO_TRASH);if(!raw)throw Error('No deleted photo is available.');const p=validatePhoto(JSON.parse(raw));if(photoAlbum.photos.some(q=>q.id===p.id)){toast('That photo is already in the album.');break}if(!confirm('Restore the '+p.view+' photo from '+p.date+'?'))break;if(await writePhotoAlbum({...photoAlbum,photos:[...photoAlbum.photos,p]})){renderPhotos();toast('Deleted photo restored.')}break}
+ case'restore-draft':{const item=photoDraftChoices[Number($('#photoDraftSelect').value)];if(!item)break;if(photoDirty||photoDecoding){openPhoto();break}if(await idbGet(item.key)!==item.raw)throw Error('That draft changed. Reload photos to refresh recovery choices.');const d=item.draft;openPhoto();photoEditId=d.id;photoImage=d.image;$('#photoDate').value=d.values.date;$('#photoView').value=d.values.view;$('#photoCaption').value=d.values.caption;markPhotoDirty();setPhotoPreview();savePhotoDraft();break}
+ case'discard-draft':{const item=photoDraftChoices[Number($('#photoDraftSelect').value)];if(!item||!confirm('Discard only this selected unfinished photo draft?'))break;if(await idbGet(item.key)!==item.raw)throw Error('That draft changed. Reload photos to refresh recovery choices.');await idbRemove(item.key);checkPhotoDrafts();break}
  }
  }catch(error){photoError(error.message)}
 });
